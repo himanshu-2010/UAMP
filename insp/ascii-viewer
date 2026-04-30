@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""
+Advanced ASCII Media Viewer for Fedora
+Original curses-based design with enhanced ASCII character sets
+"""
+
+import os
+import sys
+import time
+import curses
+import cv2
+import numpy as np
+import subprocess
+import threading
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, List, Tuple
+
+# Multiple ASCII Character Sets - from sparse to detailed
+ASCII_CHAR_SETS = {
+    "sparse": " .:-=+*#%@",
+    "standard": " .-:=+*#%@",
+    "detailed": " `.-':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@",
+    "blocks": " ░▒▓█",
+    "extended": " .oO0@",
+}
+
+ASCII_CHAR_NAMES = list(ASCII_CHAR_SETS.keys())
+
+class InputDebouncer:
+    """Handle input debouncing to prevent repetitive key presses"""
+    def __init__(self, debounce_time: float = 0.1):
+        self.debounce_time = debounce_time
+        self.last_key_time = {}
+    
+    def is_allowed(self, key: int) -> bool:
+        current_time = time.time()
+        if key not in self.last_key_time:
+            self.last_key_time[key] = current_time
+            return True
+        
+        if current_time - self.last_key_time[key] >= self.debounce_time:
+            self.last_key_time[key] = current_time
+            return True
+        return False
+
+class AudioPlayer:
+    """Handle audio playback using FFplay"""
+    def __init__(self):
+        self.process = None
+        self.is_playing = False
+        self.enabled = False
+    
+    def check_audio_available(self) -> bool:
+        """Check if audio tools are available"""
+        try:
+            subprocess.run(['ffplay', '-version'], capture_output=True, timeout=2)
+            self.enabled = True
+            return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+    
+    def play(self, file_path: str):
+        """Play audio from file"""
+        if not self.enabled:
+            return
+        
+        try:
+            if self.process:
+                self.process.terminate()
+            
+            self.process = subprocess.Popen(
+                ['ffplay', '-nodisp', '-autoexit', str(file_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            self.is_playing = True
+        except Exception as e:
+            pass
+    
+    def stop(self):
+        """Stop audio playback"""
+        if self.process:
+            try:
+                self.process.terminate()
+            except:
+                pass
+            self.is_playing = False
+
+class ASCIIViewer:
+    """Main ASCII Media Viewer Class"""
+    
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.current_path = Path.cwd()
+        self.files: List[Path] = []
+        self.selected_index = 0
+        self.mode = "browser"  # browser or viewer
+        self.current_file: Optional[Path] = None
+        
+        # Input debouncer
+        self.debouncer = InputDebouncer(debounce_time=0.15)
+        
+        # Audio player
+        self.audio_player = AudioPlayer()
+        self.audio_player.check_audio_available()
+        
+        # Settings
+        self.pixel_density = 1.0
+        self.color_mode = True
+        self.brightness = 1.0
+        self.loop = True
+        self.zoom = 1.0
+        self.contrast = 1.0
+        self.audio_enabled = False
+        
+        # ASCII Character Set - cycle through available sets
+        self.ascii_set_idx = 0  # Start with "sparse"
+        
+        # Supported formats
+        self.video_formats = {'.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.webm', '.m4v', '.3gp'}
+        self.image_formats = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.gif', '.webp', '.ppm', '.pgm', '.pbm'}
+        self.audio_formats = {'.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma', '.opus'}
+        self.supported_formats = self.video_formats | self.image_formats | self.audio_formats
+        
+        # Performance metrics
+        self.fps_display = 0
+        self.last_frame_time = time.time()
+        
+        # Setup curses
+        try:
+            curses.curs_set(0)
+            self.stdscr.nodelay(True)
+            curses.start_color()
+            curses.use_default_colors()
+            
+            for i in range(0, 256):
+                try:
+                    curses.init_pair(i + 1, i, -1)
+                except curses.error:
+                    pass
+        except Exception as e:
+            self.log_error(f"Curses initialization error: {e}")
+
+    def log_error(self, message: str):
+        """Log errors to file"""
+        try:
+            with open(os.path.expanduser("~/.ascii_viewer_errors.log"), "a") as f:
+                f.write(f"[{datetime.now()}] {message}\n")
+        except:
+            pass
+
+    def get_screen_size(self) -> Tuple[int, int]:
+        """Get current screen dimensions"""
+        try:
+            return self.stdscr.getmaxyx()
+        except:
+            return (24, 80)
+
+    def calculate_render_dimensions(self) -> Tuple[int, int]:
+        """Calculate render dimensions based on terminal size and pixel density"""
+        height, width = self.get_screen_size()
+        
+        available_height = height - 1
+        available_width = width - 1
+        
+        # Higher density = more pixels rendered = more detail
+        render_width = int(available_width / self.pixel_density)
+        render_height = int(available_height / self.pixel_density)
+        
+        render_width = max(8, render_width)
+        render_height = max(4, render_height)
+        
+        return render_width, render_height
+
+    def get_files(self):
+        """Get sorted list of files from current directory"""
+        try:
+            all_items = list(self.current_path.iterdir())
+            
+            # Separate directories and files
+            dirs = [f for f in all_items if f.is_dir()]
+            files = [f for f in all_items if f.is_file() and f.suffix.lower() in self.supported_formats]
+            
+            dirs = sorted(dirs, key=lambda x: x.name.lower())
+            files = sorted(files, key=lambda x: x.name.lower())
+            
+            sorted_items = dirs + files
+            self.files = [Path("..")] + sorted_items
+            self.selected_index = min(self.selected_index, len(self.files) - 1)
+            
+        except PermissionError:
+            self.files = [Path("..")]
+        except Exception as e:
+            self.log_error(f"Error getting files: {e}")
+            self.files = [Path("..")]
+
+    def get_file_icon(self, file: Path) -> str:
+        """Get appropriate icon for file type"""
+        if file.is_dir():
+            return "📁 "
+        
+        suffix = file.suffix.lower()
+        
+        if suffix in self.video_formats:
+            return "🎬 "
+        elif suffix in self.image_formats:
+            if suffix == '.gif':
+                return "🎞️ "
+            else:
+                return "🖼️ "
+        elif suffix in self.audio_formats:
+            return "🎵 "
+        else:
+            return "📄 "
+
+    def draw_browser(self):
+        """Draw file browser UI"""
+        try:
+            self.stdscr.clear()
+            height, width = self.get_screen_size()
+            
+            # Header
+            ascii_set_name = ASCII_CHAR_NAMES[self.ascii_set_idx]
+            title = f"🎬 ASCII Viewer ({ascii_set_name}) | {self.current_path}"
+            self.stdscr.addstr(0, 0, title[:width-1], curses.A_REVERSE | curses.A_BOLD)
+            
+            # File list
+            start_idx = max(0, self.selected_index - (height // 2 - 2))
+            end_idx = min(len(self.files), start_idx + height - 3)
+            
+            for i, file_idx in enumerate(range(start_idx, end_idx)):
+                if i + 1 >= height - 2:
+                    break
+                
+                file = self.files[file_idx]
+                prefix = "► " if file_idx == self.selected_index else "  "
+                
+                icon = self.get_file_icon(file)
+                
+                if file.name == "..":
+                    display_name = ".. (Parent Directory)"
+                else:
+                    display_name = file.name
+                
+                display_text = f"{icon}{display_name[:width-8]}"
+                
+                try:
+                    if file_idx == self.selected_index:
+                        self.stdscr.addstr(i + 1, 0, f"{prefix}{display_text}", curses.A_REVERSE)
+                    else:
+                        self.stdscr.addstr(i + 1, 0, f"{prefix}{display_text}")
+                except curses.error:
+                    pass
+            
+            # Footer
+            media_count = len([f for f in self.files[1:] if f.is_file()])
+            dir_count = len([f for f in self.files[1:] if f.is_dir()])
+            footer = (f"[↑↓] Navigate | [Enter] Select | [t] ASCII Set | [Q]uit | "
+                     f"Dirs:{dir_count} Media:{media_count}")
+            try:
+                self.stdscr.addstr(height - 1, 0, footer[:width-1], curses.A_REVERSE)
+            except curses.error:
+                pass
+            
+            self.stdscr.refresh()
+        except Exception as e:
+            self.log_error(f"Browser drawing error: {e}")
+
+    def get_ascii_char(self, gray_val: int) -> str:
+        """Get appropriate ASCII character for grayscale value"""
+        try:
+            gray_val = max(0, min(255, int(gray_val)))
+            ascii_set = ASCII_CHAR_SETS[ASCII_CHAR_NAMES[self.ascii_set_idx]]
+            idx = int((gray_val / 255) * (len(ascii_set) - 1))
+            return ascii_set[idx]
+        except Exception as e:
+            self.log_error(f"ASCII char error: {e}")
+            return " "
+
+    def render_frame(self, frame: np.ndarray):
+        """Render video frame as ASCII art"""
+        try:
+            screen_height, screen_width = self.get_screen_size()
+            
+            if frame is None or frame.size == 0:
+                return
+            
+            fh, fw = frame.shape[:2]
+            
+            # Apply brightness and contrast
+            frame = cv2.convertScaleAbs(frame, alpha=self.brightness * self.contrast, beta=0)
+            
+            # Calculate render dimensions
+            render_width, render_height = self.calculate_render_dimensions()
+            
+            # Apply zoom
+            render_width = int(render_width * self.zoom)
+            render_height = int(render_height * self.zoom)
+            
+            # Boundary check
+            render_width = min(render_width, screen_width - 1)
+            render_height = min(render_height, screen_height - 2)
+            render_width = max(8, render_width)
+            render_height = max(4, render_height)
+            
+            # Resize frame
+            resized = cv2.resize(frame, (render_width, render_height), interpolation=cv2.INTER_LINEAR)
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            
+            # Center on screen if smaller
+            start_x = max(0, (screen_width - render_width) // 2)
+            start_y = max(0, (screen_height - 2 - render_height) // 2)
+            
+            # Render ASCII art
+            self.stdscr.clear()
+            
+            for y in range(render_height):
+                for x in range(render_width):
+                    screen_x = start_x + x
+                    screen_y = start_y + y
+                    
+                    if screen_x >= screen_width - 1 or screen_y >= screen_height - 1:
+                        continue
+                    
+                    try:
+                        char = self.get_ascii_char(gray[y, x])
+                        
+                        if self.color_mode and len(resized.shape) == 3:
+                            b, g, r = [int(c) for c in resized[y, x]]
+                            color_idx = 16 + (r // 51) * 36 + (g // 51) * 6 + (b // 51)
+                            color_idx = min(255, max(16, color_idx))
+                            
+                            self.stdscr.addch(screen_y, screen_x, char, curses.color_pair(color_idx + 1))
+                        else:
+                            self.stdscr.addch(screen_y, screen_x, char)
+                    except (curses.error, IndexError):
+                        pass
+            
+            # Calculate FPS
+            current_time = time.time()
+            if self.last_frame_time > 0:
+                self.fps_display = 1 / (current_time - self.last_frame_time + 0.001)
+            self.last_frame_time = current_time
+            
+            # Status line
+            ascii_set_name = ASCII_CHAR_NAMES[self.ascii_set_idx]
+            density_str = f"PixD:{self.pixel_density:.1f}"
+            status = (f"Res:{render_width}x{render_height} {density_str} Z:{self.zoom:.1f} "
+                     f"B:{self.brightness:.1f} C:{self.contrast:.1f} ASCII:{ascii_set_name} | "
+                     f"Color:{'✓' if self.color_mode else '✗'} "
+                     f"Loop:{'✓' if self.loop else '✗'} Audio:{'♪' if self.audio_enabled else '✗'} "
+                     f"FPS:{self.fps_display:.0f} | [t]ASCII [B]ack [C]olor [L]oop [A]udio [Q]uit")
+            
+            try:
+                self.stdscr.addstr(screen_height - 1, 0, status[:screen_width-1], curses.A_REVERSE)
+            except curses.error:
+                pass
+            
+            self.stdscr.refresh()
+        except Exception as e:
+            self.log_error(f"Frame render error: {e}")
+
+    def handle_viewer_input(self, key: int) -> bool:
+        """Handle input in viewer mode. Returns False to exit viewer."""
+        if not self.debouncer.is_allowed(key):
+            return True
+        
+        try:
+            if key == ord('q'):
+                sys.exit(0)
+            elif key == ord('b') or key == 27:  # B or Esc
+                self.mode = "browser"
+                self.audio_player.stop()
+                return False
+            elif key == ord('c'):
+                self.color_mode = not self.color_mode
+            elif key == ord('=') or key == ord('+'):
+                self.brightness = min(3.0, self.brightness + 0.1)
+            elif key == ord('-') or key == ord('_'):
+                self.brightness = max(0.1, self.brightness - 0.1)
+            elif key == ord(']'):
+                self.pixel_density = min(5.0, self.pixel_density + 0.1)
+            elif key == ord('['):
+                self.pixel_density = max(0.1, self.pixel_density - 0.1)
+            elif key == ord('z'):
+                self.zoom = min(5.0, self.zoom + 0.2)
+            elif key == ord('x'):
+                self.zoom = max(0.2, self.zoom - 0.2)
+            elif key == ord('l'):
+                self.loop = not self.loop
+            elif key == ord('a'):
+                self.audio_enabled = not self.audio_enabled
+            elif key == ord('t'):
+                # Cycle through ASCII character sets
+                self.ascii_set_idx = (self.ascii_set_idx + 1) % len(ASCII_CHAR_NAMES)
+            elif key == ord('{'):
+                self.contrast = max(0.1, self.contrast - 0.1)
+            elif key == ord('}'):
+                self.contrast = min(3.0, self.contrast + 0.1)
+            elif key == curses.KEY_RIGHT:
+                try:
+                    cap = cv2.VideoCapture(str(self.current_file))
+                    pos = cap.get(cv2.CAP_PROP_POS_MSEC)
+                    cap.set(cv2.CAP_PROP_POS_MSEC, pos + 30000)
+                    cap.release()
+                except:
+                    pass
+            elif key == curses.KEY_LEFT:
+                try:
+                    cap = cv2.VideoCapture(str(self.current_file))
+                    pos = cap.get(cv2.CAP_PROP_POS_MSEC)
+                    cap.set(cv2.CAP_PROP_POS_MSEC, max(0, pos - 30000))
+                    cap.release()
+                except:
+                    pass
+            elif key == ord('n'):
+                self.play_next_file()
+                return False
+            elif key == ord('p'):
+                self.play_prev_file()
+                return False
+        except Exception as e:
+            self.log_error(f"Input handler error: {e}")
+        
+        return True
+
+    def play_next_file(self):
+        """Play next media file"""
+        try:
+            media_files = [f for f in self.files if f.is_file()]
+            if not media_files:
+                return
+            
+            try:
+                current_idx = media_files.index(self.current_file)
+                next_idx = (current_idx + 1) % len(media_files)
+                self.current_file = media_files[next_idx]
+            except (ValueError, IndexError):
+                self.current_file = media_files[0]
+        except Exception as e:
+            self.log_error(f"Next file error: {e}")
+
+    def play_prev_file(self):
+        """Play previous media file"""
+        try:
+            media_files = [f for f in self.files if f.is_file()]
+            if not media_files:
+                return
+            
+            try:
+                current_idx = media_files.index(self.current_file)
+                prev_idx = (current_idx - 1) % len(media_files)
+                self.current_file = media_files[prev_idx]
+            except (ValueError, IndexError):
+                self.current_file = media_files[-1]
+        except Exception as e:
+            self.log_error(f"Prev file error: {e}")
+
+    def display_image(self, file_path: Path):
+        """Display static image indefinitely"""
+        try:
+            img = cv2.imread(str(file_path))
+            if img is None:
+                self.log_error(f"Cannot read image: {file_path}")
+                self.mode = "browser"
+                return
+            
+            while self.mode == "viewer":
+                self.render_frame(img)
+                
+                key = self.stdscr.getch()
+                if key != -1:
+                    if not self.handle_viewer_input(key):
+                        break
+                
+                time.sleep(0.05)
+        
+        except Exception as e:
+            self.log_error(f"Image display error: {e}")
+            self.mode = "browser"
+
+    def play_media(self, file_path: Path):
+        """Play media file (video, GIF, or image)"""
+        try:
+            suffix = file_path.suffix.lower()
+            
+            # Handle static images
+            if suffix in {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp', '.ppm', '.pgm', '.pbm'}:
+                self.display_image(file_path)
+                return
+            
+            # Handle video and GIF
+            cap = cv2.VideoCapture(str(file_path))
+            if not cap.isOpened():
+                self.log_error(f"Cannot open file: {file_path}")
+                self.mode = "browser"
+                return
+            
+            # Start audio if enabled
+            if self.audio_enabled and self.audio_player.enabled and suffix not in self.image_formats:
+                self.audio_player.play(str(file_path))
+            
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps <= 0 or fps > 120:
+                fps = 24
+            
+            frame_delay = 1 / fps
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            frame_count = 0
+            
+            while self.mode == "viewer":
+                ret, frame = cap.read()
+                frame_count += 1
+                
+                if not ret:
+                    if self.loop:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        frame_count = 0
+                        if self.audio_enabled and self.audio_player.enabled:
+                            self.audio_player.play(str(file_path))
+                        continue
+                    else:
+                        break
+                
+                self.render_frame(frame)
+                
+                key = self.stdscr.getch()
+                if key != -1:
+                    if not self.handle_viewer_input(key):
+                        break
+                
+                time.sleep(frame_delay)
+            
+            cap.release()
+            self.audio_player.stop()
+        
+        except Exception as e:
+            self.log_error(f"Media playback error: {e}")
+            self.mode = "browser"
+
+    def run(self):
+        """Main event loop"""
+        try:
+            self.get_files()
+            
+            while True:
+                if self.mode == "browser":
+                    self.draw_browser()
+                    
+                    key = self.stdscr.getch()
+                    
+                    if key == -1:
+                        time.sleep(0.01)
+                        continue
+                    
+                    if not self.debouncer.is_allowed(key):
+                        continue
+                    
+                    try:
+                        if key == ord('q'):
+                            break
+                        elif key == curses.KEY_UP:
+                            self.selected_index = max(0, self.selected_index - 1)
+                        elif key == curses.KEY_DOWN:
+                            self.selected_index = min(len(self.files) - 1, self.selected_index + 1)
+                        elif key == ord('\n') or key == ord(' '):
+                            selected = self.files[self.selected_index]
+                            
+                            if selected.is_dir():
+                                if selected.name == "..":
+                                    self.current_path = self.current_path.parent
+                                else:
+                                    self.current_path = selected
+                                self.get_files()
+                                self.selected_index = 0
+                            else:
+                                self.mode = "viewer"
+                                self.current_file = selected
+                                self.play_media(selected)
+                                self.mode = "browser"
+                        elif key == ord('t'):
+                            # Cycle ASCII sets in browser too
+                            self.ascii_set_idx = (self.ascii_set_idx + 1) % len(ASCII_CHAR_NAMES)
+                    except Exception as e:
+                        self.log_error(f"Browser input error: {e}")
+                
+                time.sleep(0.01)
+        
+        except KeyboardInterrupt:
+            self.audio_player.stop()
+        except Exception as e:
+            self.log_error(f"Main loop error: {e}")
+        finally:
+            self.audio_player.stop()
+
+def check_dependencies():
+    """Check if required dependencies are installed"""
+    dependencies = {
+        'cv2': 'python3-opencv',
+        'numpy': 'python3-numpy',
+    }
+    
+    missing = []
+    for module, package in dependencies.items():
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(package)
+    
+    if missing:
+        print("Missing dependencies. Install with:", file=sys.stderr)
+        print(f"sudo dnf install {' '.join(missing)}", file=sys.stderr)
+        return False
+    return True
+
+def main():
+    """Main entry point"""
+    try:
+        if not check_dependencies():
+            sys.exit(1)
+        
+        curses.wrapper(lambda stdscr: ASCIIViewer(stdscr).run())
+    except KeyboardInterrupt:
+        print("\nExiting...", file=sys.stderr)
+    except Exception as e:
+        print(f"Fatal error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

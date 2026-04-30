@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uamp"
+version = "0.1.0"
+authors = [
+  { name="Himanshu", email="himanshu@example.com" },
+]
+description = "Universal ASCII Media Player - High-res media in your terminal"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Console :: Curses",
+]
+
+[project.scripts]
+uamp = "uamp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["uamp*"]

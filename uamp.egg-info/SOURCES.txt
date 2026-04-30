@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+uamp/cli.py
+uamp/fsal.py
+uamp/media_engine.py
+uamp/settings.py
+uamp/tui.py
+uamp.egg-info/PKG-INFO
+uamp.egg-info/SOURCES.txt
+uamp.egg-info/dependency_links.txt
+uamp.egg-info/entry_points.txt
+uamp.egg-info/requires.txt
+uamp.egg-info/top_level.txt

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=UAMP
+Comment=Universal ASCII Media Player
+Exec=uamp
+Terminal=true
+Icon=uamp
+Categories=Multimedia;Video;Player;
+Keywords=ASCII;Media;Video;Player;

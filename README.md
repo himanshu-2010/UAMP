@@ -1,0 +1,40 @@
+# UAMP - Universal ASCII Media Player
+
+A professional terminal media player for Linux that renders images and videos as high-resolution ASCII or Braille art.
+
+## Features
+- **High-Res Braille Mode**: 2x4 dots per character for extreme detail.
+- **True Color**: Toggle 256-color support.
+- **Pixel Density**: Adjust sampling resolution in real-time.
+- **Smooth Zoom**: Zoom into any part of a video or image.
+- **Playlist Support**: Quick navigation between files in a directory.
+- **Synchronized Audio**: Full audio playback via FFmpeg.
+
+## Installation (Any Linux Distro)
+1. Ensure you have `ffmpeg` installed.
+2. Run the installer:
+   ```bash
+   ./install.sh
+   ```
+
+## Usage
+- Run from terminal: `uamp` or `uamp /path/to/media`
+- Open from App Menu: Search for **UAMP**.
+
+## Controls
+### Browser
+- **↑↓**: Navigate
+- **Enter**: Play File / Open Dir
+- **Esc / Backspace**: Parent Directory
+- **Q**: Quit
+
+### Player
+- **Space**: Pause / Resume
+- **N / P**: Next / Previous File
+- **Z / X**: Zoom In / Out
+- **C**: Toggle Color Mode
+- **B**: Toggle Braille Mode
+- **D**: Cycle Pixel Density (1x, 2x, 3x)
+- **1 - 4**: Switch Character Sets
+- **+ / -**: Adjust Playback Speed (FPS)
+- **H**: Toggle Help Menu
