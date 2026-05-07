@@ -38,3 +38,4 @@ A professional terminal media player for Linux that renders images and videos as
 - **1 - 4**: Switch Character Sets
 - **+ / -**: Adjust Playback Speed (FPS)
 - **H**: Toggle Help Menu
+- **<-/->**: skip 15 sec
