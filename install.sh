@@ -15,12 +15,12 @@ fi
 # 2. Determine Install Mode
 if [ "$EUID" -eq 0 ]; then
     echo "Running as root. Performing system-wide installation..."
-    PIPCMD="pip install . --break-system-packages"
+    PIPCMD="pip install --upgrade --force-reinstall . --break-system-packages"
     BIN_DIR="/usr/local/bin"
     APPS_DIR="/usr/share/applications"
 else
     echo "Running as user. Performing local installation..."
-    PIPCMD="pip install --user . --break-system-packages"
+    PIPCMD="pip install --user --upgrade --force-reinstall . --break-system-packages"
     BIN_DIR="$HOME/.local/bin"
     APPS_DIR="$HOME/.local/share/applications"
     mkdir -p "$BIN_DIR"

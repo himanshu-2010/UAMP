@@ -53,15 +53,19 @@ class Frame:
 
         # 2. Render
         if mode == 'braille':
-            # Braille ignore density for now as it's already high-res
             target_h, target_w = term_h * 4, term_w * 2
             row_idx = (np.arange(target_h) * lum_data.shape[0] / target_h).astype(np.int32)
             col_idx = (np.arange(target_w) * lum_data.shape[1] / target_w).astype(np.int32)
             lum_data = lum_data[np.ix_(row_idx, col_idx)]
             rgb_data = rgb_data[np.ix_(row_idx, col_idx)]
             lines = self._render_braille(lum_data, rgb_data, color_mode)
+        elif mode == 'hq':
+            target_h, target_w = term_h * 2, term_w
+            row_idx = (np.arange(target_h) * lum_data.shape[0] / target_h).astype(np.int32)
+            col_idx = (np.arange(target_w) * lum_data.shape[1] / target_w).astype(np.int32)
+            rgb_data = rgb_data[np.ix_(row_idx, col_idx)]
+            lines = self._render_hq(rgb_data, color_mode)
         else:
-            # ASCII respects density (1x, 2x, 3x)
             target_h, target_w = term_h, term_w * density
             row_idx = (np.arange(target_h) * lum_data.shape[0] / target_h).astype(np.int32)
             col_idx = (np.arange(target_w) * lum_data.shape[1] / target_w).astype(np.int32)
@@ -70,6 +74,18 @@ class Frame:
             lines = self._render_ascii(lum_data, rgb_data, charset, color_mode, density)
         
         self._cache[key] = lines
+        return lines
+
+    def _render_hq(self, rgb, color_mode):
+        h, w = rgb.shape[:2]
+        lines = []
+        for y in range(0, h, 2):
+            line_segments = []
+            for x in range(w):
+                top_r, top_g, top_b = rgb[y, x]
+                top_idx = get_color_index(top_r, top_g, top_b)
+                line_segments.append(('▀', top_idx))
+            lines.append(line_segments)
         return lines
 
     def _render_braille(self, lum, rgb, color_mode):
@@ -103,9 +119,15 @@ class Frame:
             lines.append(line_segments)
         return lines
 
+def is_url(path):
+    return any(path.startswith(prefix) for prefix in ['http://', 'https://', 'rtsp://', 'rtmp://'])
+
 class MediaEngine:
     def __init__(self, filepath: Path, term_w, term_h, settings):
-        self.filepath = filepath
+        self.filepath = Path(filepath) if isinstance(filepath, str) and not is_url(filepath) else filepath
+        if isinstance(filepath, str) and not isinstance(self.filepath, Path):
+            self.filepath = filepath # Keep as string if it's a URL
+        
         self.term_w = term_w
         self.term_h = term_h
         self.settings = settings
@@ -114,16 +136,63 @@ class MediaEngine:
         self.loaded = False
         self._stop = threading.Event()
         self._audio = None
+        self.error_msg = None
+        self.is_static = False
+        self.duration = 0
+        self.seek_time = 0
+        
+        self._get_metadata()
 
-    def start_loading(self):
-        t = threading.Thread(target=self._decode, daemon=True)
-        t.start()
-        self._start_audio()
-
-    def _start_audio(self):
+    def _get_metadata(self):
         try:
+            cmd = ['ffprobe', '-v', 'quiet', '-show_format', '-print_format', 'json', str(self.filepath)]
+            res = subprocess.check_output(cmd)
+            data = json.loads(res)
+            self.duration = float(data.get('format', {}).get('duration', 0))
+        except: pass
+
+    @property
+    def current_time(self):
+        # This is a bit of a hack since the engine doesn't track playback position
+        # but the GUI/TUI do via cur_idx. 
+        # We'll return the decode progress time if called without context.
+        return self.seek_time + (len(self.frames) / self.settings.fps)
+
+    def start(self, seek_time=0):
+        self.seek_time = seek_time
+        t = threading.Thread(target=self._decode, args=(seek_time,), daemon=True)
+        t.start()
+        self._start_audio(seek_time)
+
+    def _decode_sync(self, limit=1):
+        """Synchronously decode a few frames."""
+        # Using a fixed resolution for previews to avoid huge memory usage
+        sw, sh = min(200, self.term_w * 2), min(100, self.term_h * 2)
+        cmd = [
+            'ffmpeg', '-i', str(self.filepath),
+            '-vf', f'scale={sw}:{sh}',
+            '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-vframes', str(limit), 'pipe:1'
+        ]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            chunk_size = sw * sh * 3
+            for _ in range(limit):
+                raw = proc.stdout.read(chunk_size)
+                if not raw or len(raw) < chunk_size: break
+                rgb = np.frombuffer(raw, dtype=np.uint8).reshape((sh, sw, 3))
+                lum = (rgb[:,:,0]*LUM_R + rgb[:,:,1]*LUM_G + rgb[:,:,2]*LUM_B) / 255.0
+                self.frames.append(Frame(lum, rgb.copy()))
+            proc.terminate()
+        except: pass
+
+    def _start_audio(self, seek_time=0):
+        try:
+            cmd = ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet']
+            if seek_time > 0:
+                cmd.extend(['-ss', str(seek_time)])
+            cmd.append(str(self.filepath))
             self._audio = subprocess.Popen(
-                ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', str(self.filepath)],
+                cmd,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 preexec_fn=os.setsid
             )
@@ -138,21 +207,23 @@ class MediaEngine:
                 try: self._audio.terminate()
                 except: pass
 
-    def _decode(self):
+    def _decode(self, seek_time=0):
         from uamp.fsal import IMAGE_EXTS
-        # High-res master sampling to support density/zoom
-        sw, sh = self.term_w * 6, self.term_h * 4 # Max density (3) * width + Braille height
+        sw, sh = self.term_w * 6, self.term_h * 4
         
-        ext = self.filepath.suffix.lower()
+        ext = self.filepath.suffix.lower() if isinstance(self.filepath, Path) else ""
         is_animated_format = ext in {'.gif', '.webp'}
-        is_static = (ext in IMAGE_EXTS) and not is_animated_format
-        decode_fps = self.settings.fps if not is_static else 1
+        self.is_static = (ext in IMAGE_EXTS) and not is_animated_format
+        decode_fps = self.settings.fps if not self.is_static else 1
         
-        cmd = [
-            'ffmpeg', '-i', str(self.filepath),
+        cmd = ['ffmpeg']
+        if seek_time > 0:
+            cmd.extend(['-ss', str(seek_time)])
+        cmd.extend([
+            '-i', str(self.filepath),
             '-vf', f'scale={sw}:{sh},fps={decode_fps}:round=up',
             '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'
-        ]
+        ])
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             chunk_size = sw * sh * 3
@@ -165,20 +236,30 @@ class MediaEngine:
                 if hi > lo: lum = np.clip((lum - lo) / (hi - lo), 0, 1)
                 else: lum = np.clip(lum, 0, 1)
                 self.frames.append(Frame(lum, rgb.copy()))
-                if is_static: break
+                if self.is_static: break
             proc.terminate()
-        except: pass
+        except Exception as e:
+            self.error_msg = str(e)
         self.loaded = True
 
     def get_frame(self, idx, w, h):
         if not self.frames: return None
         f = self.frames[idx % len(self.frames)]
         s = self.settings
+        mode = 'ascii'
+        if s.braille_mode: mode = 'braille'
+        elif getattr(s, 'hq_mode', False): mode = 'hq'
+        
         return f.render(
-            'braille' if s.braille_mode else 'ascii',
+            mode,
             ASCII_SETS[s.charset_key], 
             s.color_mode, 
             s.zoom, 
             s.density,
             w, h
         )
+
+    def get_raw_frame(self, idx):
+        if not self.frames: return None
+        return self.frames[idx % len(self.frames)].rgb
+

@@ -3,7 +3,10 @@ UAMP - File System Abstraction Layer
 Handles directory navigation, file listing, and type detection.
 """
 
+import subprocess
+import json
 from pathlib import Path
+from datetime import datetime
 
 # Supported file extensions
 VIDEO_EXTS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv', '.m4v', '.ts'}
@@ -32,6 +35,57 @@ def get_file_type(path: Path) -> str:
     if ext in AUDIO_EXTS:
         return 'audio'
     return 'file'
+
+
+def get_metadata(path: Path) -> dict:
+    """Extract metadata for a file."""
+    meta = {
+        'Size': 'Unknown',
+        'Modified': 'Unknown',
+        'Type': get_file_type(path),
+    }
+    
+    try:
+        stat = path.stat()
+        size = stat.st_size
+        if size < 1024:
+            meta['Size'] = f"{size} B"
+        elif size < 1024 * 1024:
+            meta['Size'] = f"{size/1024:.1f} KB"
+        elif size < 1024 * 1024 * 1024:
+            meta['Size'] = f"{size/(1024*1024):.1f} MB"
+        else:
+            meta['Size'] = f"{size/(1024*1024*1024):.1f} GB"
+        
+        meta['Modified'] = datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')
+    except: pass
+
+    if meta['Type'] in ('video', 'audio', 'image'):
+        try:
+            cmd = [
+                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                '-show_format', '-show_streams', str(path)
+            ]
+            res = subprocess.check_output(cmd)
+            data = json.loads(res)
+            
+            fmt = data.get('format', {})
+            if 'duration' in fmt:
+                d = float(fmt['duration'])
+                meta['Duration'] = f"{int(d//60):02}:{int(d%60):02}"
+            
+            if 'bit_rate' in fmt:
+                meta['Bitrate'] = f"{int(fmt['bit_rate'])/1000:.0f} kbps"
+
+            for stream in data.get('streams', []):
+                if stream.get('codec_type') == 'video':
+                    meta['Resolution'] = f"{stream.get('width')}x{stream.get('height')}"
+                    meta['Codec'] = stream.get('codec_name')
+                elif stream.get('codec_type') == 'audio' and 'Codec' not in meta:
+                    meta['Codec'] = stream.get('codec_name')
+        except: pass
+        
+    return meta
 
 
 class FileManager:
